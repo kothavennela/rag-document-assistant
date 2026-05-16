@@ -1,26 +1,45 @@
 import numpy as np
+import json
+import nltk
+
+from pathlib import Path
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from pathlib import Path
-import json
+from nltk.tokenize import sent_tokenize
 from google.colab import ai
 
 # ----------------------------
-# Setup
+# NLTK
 # ----------------------------
 
-transformer_model = SentenceTransformer('all-MiniLM-L6-v2')
+nltk.download("punkt")
+nltk.download("punkt_tab")
 
-pdf_file = "Grandma's Bag of Stories by Sudha Murthy.pdf"
-memory_file = "sample (1).json"
+# ----------------------------
+# CONFIG
+# ----------------------------
 
-llm_model = "ai"
+PDF_FILE = "Grandma's Bag of Stories by Sudha Murthy.pdf"
 
-TOP_K = 3
+MEMORY_FILE = "memory.json"
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
 MIN_SIMILARITY_THRESHOLD = 0.30
 
+CHUNK_SIZE = 8
+OVERLAP_SIZE = 2
+
 # ----------------------------
-# Memory Loader
+# MODEL
+# ----------------------------
+
+transformer_model = SentenceTransformer(
+    EMBEDDING_MODEL
+)
+
+# ----------------------------
+# MEMORY
 # ----------------------------
 
 def load_memory(memory_file):
@@ -29,80 +48,126 @@ def load_memory(memory_file):
 
     if memory_path.is_file():
 
-        print("file exists")
+        with open(memory_file, "r") as f:
 
-        with open(memory_file, 'r') as f:
-            memory_data_dict = json.load(f)
+            return json.load(f)
 
-    else:
-
-        memory_data_dict = {
-            "chat_history": [],
-            "memory_summary": "",
-            "facts": {
-                "preferences": [],
-                "user_info": []
-            }
+    return {
+        "chat_history": [],
+        "memory_summary": "",
+        "facts": {
+            "preferences": [],
+            "user_info": []
         }
-
-    return memory_data_dict
+    }
 
 # ----------------------------
-# PDF Text Extraction
+# PDF EXTRACTION
 # ----------------------------
 
-def extract_text(pdf_file):
+def extract_text_from_pdf(pdf_file):
 
     reader = PdfReader(pdf_file)
 
-    text = ""
+    pages_data = []
 
-    for page in reader.pages:
-        extracted = page.extract_text()
+    for page_number, page in enumerate(reader.pages,start=1):
 
-        if extracted:
-            text += extracted + "\n"
+        extracted_text = page.extract_text()
 
-    return text
+        if extracted_text:
+
+            pages_data.append({
+                "page_number": page_number,
+                "text": extracted_text
+            })
+
+    return pages_data
 
 # ----------------------------
-# Better Chunking
+# CHUNKING
 # ----------------------------
 
-def make_chunks(text, chunk_size=500, overlap_size=50):
-
-    words = text.split()
+def make_chunks(pages_data,chunk_size=CHUNK_SIZE,overlap_size=OVERLAP_SIZE):
 
     chunks = []
 
-    start = 0
+    global_word_index = 0
 
-    while start < len(words):
+    for page_data in pages_data:
 
-        end = start + chunk_size
+        page_number = page_data["page_number"]
 
-        chunk_words = words[start:end]
+        text = page_data["text"]
 
-        chunk_text = " ".join(chunk_words)
+        sentences = sent_tokenize(text)
 
-        chunks.append({
-            "chunk_id": len(chunks),
-            "text": chunk_text
-        })
+        start = 0
 
-        start += chunk_size - overlap_size
+        while start < len(sentences):
 
-    chunk_texts = [chunk["text"] for chunk in chunks]
+            end = start + chunk_size
 
-    chunks_embeddings = transformer_model.encode(
+            chunk_sentences = sentences[start:end]
+
+            chunk_text = " ".join(chunk_sentences)
+
+            word_count = len(chunk_text.split())
+
+            chunk_metadata = {
+
+                "chunk_id": len(chunks),
+
+                "page_number": page_number,
+
+                "start_word": global_word_index,
+
+                "word_count": word_count,
+
+                "sentence_count": len(
+                    chunk_sentences
+                ),
+
+                "text": chunk_text
+            }
+
+            chunks.append(chunk_metadata)
+
+            global_word_index += word_count
+
+            start += (
+                chunk_size - overlap_size
+            )
+
+    return chunks
+
+# ----------------------------
+# EMBEDDINGS
+# ----------------------------
+
+def create_embeddings(chunks):
+
+    chunk_texts = [
+
+        chunk["text"]
+
+        for chunk in chunks
+    ]
+
+    embeddings = transformer_model.encode(
+
         chunk_texts,
+
         normalize_embeddings=True
     )
 
-    return chunks, chunks_embeddings
+    return np.array(
+        embeddings,
+        dtype=np.float32
+    )
 
 # ----------------------------
-# Query Expansion
+# QUERY EXPANSION
 # ----------------------------
 
 def expand_query(query):
@@ -110,311 +175,398 @@ def expand_query(query):
     query_lower = query.lower()
 
     if "theme" in query_lower:
-        return query + " main idea message moral lesson"
 
-    if "central idea" in query_lower:
-        return query + " main message lesson"
+        return (
+            query
+            + " main idea moral lesson"
+        )
 
     if "values" in query_lower:
-        return query + " morals ethics teachings"
+
+        return (
+            query
+            + " ethics teachings morals"
+        )
+
+    if "compare" in query_lower:
+
+        return (
+            query
+            + " differences similarities"
+        )
 
     return query
 
 # ----------------------------
-# Cosine Similarity Search
+# COSINE SEARCH
 # ----------------------------
 
-def cosine_search(query_vector, chunks_embeddings):
+def cosine_search(
+    query_vector,
+    chunk_embeddings
+):
 
-    scores = np.dot(chunks_embeddings, query_vector)
+    similarity_scores = np.dot(
+        chunk_embeddings,
+        query_vector
+    )
 
     ranked_scores = []
 
-    for index, score in enumerate(scores):
+    for index, score in enumerate(
+        similarity_scores
+    ):
 
-        ranked_scores.append((score, index))
+        ranked_scores.append(
+            (score, index)
+        )
 
     ranked_scores = sorted(
+
         ranked_scores,
+
         key=lambda x: x[0],
+
         reverse=True
     )
 
-    return ranked_scores[:TOP_K]
+    best_score = ranked_scores[0][0]
+
+    if best_score > 0.65:
+
+        top_k = 2
+
+    elif best_score > 0.45:
+
+        top_k = 4
+
+    else:
+
+        top_k = 6
+
+    return ranked_scores[:top_k]
 
 # ----------------------------
-# LLM Response
+# RETRIEVAL
 # ----------------------------
 
-def generate_answer(prompt_input):
+def retrieve_chunks(
+    user_query,
+    chunks,
+    chunk_embeddings
+):
 
-    if llm_model == "ai":
-
-        response = ai.generate_text(prompt_input)
-
-        answer_text = (
-            response.text
-            if hasattr(response, "text")
-            else str(response)
-        )
-
-    return answer_text
-
-# ----------------------------
-# Build System
-# ----------------------------
-
-text = extract_text(pdf_file)
-
-chunks, chunks_embeddings = make_chunks(text)
-
-print("✅ Ready. Ask questions. Type 'exit' to stop.\n")
-
-# ----------------------------
-# Chat Loop
-# ----------------------------
-
-while True:
-
-    user_query_chat = input("Ask a query to your assistant : ")
-
-    if user_query_chat.lower() in ["exit", "quit", "stop", "break"]:
-
-        print("exiting")
-
-        break
-
-    memory_data_dict = load_memory(memory_file)
-
-    # ----------------------------
-    # Query Expansion
-    # ----------------------------
-
-    expanded_query = expand_query(user_query_chat)
-
-    # ----------------------------
-    # Query Embedding
-    # ----------------------------
+    expanded_query = expand_query(
+        user_query
+    )
 
     query_embedding = transformer_model.encode(
+
         [expanded_query],
+
         normalize_embeddings=True
     )
 
     query_vector = query_embedding[0]
 
-    # ----------------------------
-    # Retrieval
-    # ----------------------------
+    top_results = cosine_search(
 
-    top_scores = cosine_search(
         query_vector,
-        chunks_embeddings
+
+        chunk_embeddings
     )
 
-    print("\nTop retrieved chunks:\n")
+    retrieved_results = []
 
-    for rank, (score, index) in enumerate(top_scores, start=1):
+    for score, index in top_results:
 
-        print(f"Rank: {rank}")
+        retrieved_results.append({
 
-        print(f"Score: {score:.4f}")
+            "score": float(score),
 
-        print(f"Chunk ID: {chunks[index]['chunk_id']}")
+            "chunk": chunks[index]
+        })
 
-        print("\nChunk Preview:\n")
+    return retrieved_results
 
-        print(chunks[index]["text"][:500])
+# ----------------------------
+# CONTEXT BUILDER
+# ----------------------------
 
-        print("\n" + "-" * 60)
+def build_context(retrieved_results):
 
-    # ----------------------------
-    # Hallucination Control
-    # ----------------------------
+    context = ""
 
-    best_score = top_scores[0][0]
+    for item in retrieved_results:
 
-    if best_score < MIN_SIMILARITY_THRESHOLD:
+        score = item["score"]
 
-        print("\nAnswer:\n Evidence is weak or missing.\n")
-
-        continue
-
-    # ----------------------------
-    # Context Builder
-    # ----------------------------
-
-    context_to_current_chat_retrieve = ""
-
-    for score, index in top_scores:
+        chunk = item["chunk"]
 
         if score >= MIN_SIMILARITY_THRESHOLD:
 
-            context_to_current_chat_retrieve += f"""
+            context += f"""
 
-Chunk ID: {chunks[index]["chunk_id"]}
+Chunk ID: {chunk["chunk_id"]}
+
+Page Number: {chunk["page_number"]}
 
 Similarity Score: {score:.4f}
 
-{chunks[index]["text"]}
+Text:
+{chunk["text"]}
 
 """
 
-    # ----------------------------
-    # Recent Chat History
-    # ----------------------------
+    return context
 
-    recent_3_chat_text = ""
+# ----------------------------
+# ANSWER GENERATION
+# ----------------------------
 
-    for query, ans in memory_data_dict["chat_history"][-3:]:
+def generate_answer(prompt):
 
-        recent_3_chat_text += f"""
-Q: {query}
-A: {ans}
+    response = ai.generate_text(prompt)
+
+    answer_text = (
+
+        response.text
+
+        if hasattr(response, "text")
+
+        else str(response)
+    )
+
+    return answer_text
+
+# ----------------------------
+# BUILD PIPELINE
+# ----------------------------
+
+pages_data = extract_text_from_pdf(
+    PDF_FILE
+)
+
+chunks = make_chunks(
+    pages_data
+)
+
+chunk_embeddings = create_embeddings(
+    chunks
+)
+
+print("✅ RAG System Ready")
+
+# ----------------------------
+# CHAT LOOP
+# ----------------------------
+
+while True:
+
+    user_query = input(
+        "\nAsk your question: "
+    )
+
+    if user_query.lower() in [
+
+        "exit",
+        "quit",
+        "stop",
+        "break"
+
+    ]:
+
+        print("Exiting...")
+        break
+
+    memory_data_dict = load_memory(
+        MEMORY_FILE
+    )
+
+    retrieved_results = retrieve_chunks(
+
+        user_query,
+
+        chunks,
+
+        chunk_embeddings
+    )
+
+    print("\nRetrieved Chunks:\n")
+
+    for rank, item in enumerate(
+
+        retrieved_results,
+
+        start=1
+    ):
+
+        score = item["score"]
+
+        chunk = item["chunk"]
+
+        print(f"Rank: {rank}")
+
+        print(
+            f"Score: {score:.4f}"
+        )
+
+        print(
+            f"Chunk ID: {chunk['chunk_id']}"
+        )
+
+        print(
+            f"Page: {chunk['page_number']}"
+        )
+
+        print(
+            f"Start Word: {chunk['start_word']}"
+        )
+
+        print(
+            f"Sentence Count: {chunk['sentence_count']}"
+        )
+
+        print(
+            f"Word Count: {chunk['word_count']}"
+        )
+
+        print("\nChunk Preview:\n")
+
+        print(chunk["text"][:500])
+
+        print("\n" + "-" * 60)
+
+    best_score = retrieved_results[0]["score"]
+
+    if best_score < MIN_SIMILARITY_THRESHOLD:
+
+        print(
+            "\nEvidence is weak or missing."
+        )
+
+        continue
+
+    context = build_context(
+        retrieved_results
+    )
+
+    recent_chat = ""
+
+    for question, answer in memory_data_dict[
+        "chat_history"
+    ][-3:]:
+
+        recent_chat += f"""
+
+Q: {question}
+
+A: {answer}
 
 """
 
-    # ----------------------------
-    # Facts Memory
-    # ----------------------------
-
-    query_lower = user_query_chat.lower()
-
-    if (
-        "favorite" in query_lower
-        or "i like" in query_lower
-    ):
-
-        if user_query_chat not in memory_data_dict["facts"]["preferences"]:
-
-            memory_data_dict["facts"]["preferences"].append(
-                user_query_chat
-            )
-
-    if (
-        "my name is" in query_lower
-        or "i am" in query_lower
-    ):
-
-        if user_query_chat not in memory_data_dict["facts"]["user_info"]:
-
-            memory_data_dict["facts"]["user_info"].append(
-                user_query_chat
-            )
-
-    # ----------------------------
-    # Prompt
-    # ----------------------------
-
-    prompt_current_chat = f"""
+    prompt = f"""
 You are a precise AI document assistant.
-
-Your task:
-- Answer ONLY from retrieved context
-- Do NOT invent information
-- Do NOT hallucinate
-- If evidence is weak or missing, clearly say:
-  "Evidence is weak or missing."
 
 Rules:
 1. Use ONLY retrieved context
-2. Do not use outside knowledge
-3. Be concise
-4. If unsure, say evidence missing
+2. No hallucination
+3. If unsure say:
+   Evidence is weak or missing
+4. Be concise
 5. Mention uncertainty honestly
 
-Facts:
-Preferences:
-{memory_data_dict["facts"]["preferences"]}
-
-User Info:
-{memory_data_dict["facts"]["user_info"]}
-
 Recent Conversation:
-{recent_3_chat_text}
+{recent_chat}
 
 Retrieved Context:
-{context_to_current_chat_retrieve}
+{context}
 
 Question:
-{user_query_chat}
+{user_query}
 
 Answer:
 """
 
-    # ----------------------------
-    # Generate Answer
-    # ----------------------------
-
-    answer_text = generate_answer(prompt_current_chat)
+    answer = generate_answer(
+        prompt
+    )
 
     print("\nAnswer:\n")
 
-    print(answer_text)
+    print(answer)
 
     # ----------------------------
-    # Save Chat
+    # MEMORY SAVE
     # ----------------------------
 
-    memory_data_dict["chat_history"].append(
-        (user_query_chat, answer_text)
+    memory_data_dict[
+        "chat_history"
+    ].append(
+
+        (user_query, answer)
     )
 
-    with open(memory_file, 'w') as f:
+    with open(
+        MEMORY_FILE,
+        "w"
+    ) as f:
 
-        json.dump(memory_data_dict, f, indent=2)
-
-    # ----------------------------
-    # Long-Term Memory Summary
-    # ----------------------------
-
-    if len(memory_data_dict["chat_history"]) > 5:
-
-        old_chat_context = ""
-
-        for ques, ans in memory_data_dict["chat_history"][:-3]:
-
-            old_chat_context += f"""
-Question: {ques}
-
-Answer: {ans}
-
-"""
-
-        summarize_prompt = f"""
-You are a memory compression system.
-
-Summarize ONLY important long-term knowledge.
-
-Keep:
-- important discussions
-- key answers
-- unresolved questions
-
-Remove:
-- repeated content
-- greetings
-- small talk
-
-Previous Memory:
-{memory_data_dict["memory_summary"]}
-
-New Conversations:
-{old_chat_context}
-
-Updated Memory:
-"""
-
-        memory_summary = generate_answer(
-            summarize_prompt
+        json.dump(
+            memory_data_dict,
+            f,
+            indent=2
         )
 
-        memory_data_dict["memory_summary"] = memory_summary
+    # ----------------------------
+    # FACT STORAGE
+    # ----------------------------
 
-        memory_data_dict["chat_history"] = (
-            memory_data_dict["chat_history"][-3:]
+    query_lower = user_query.lower()
+
+    if (
+
+        "favorite" in query_lower
+
+        or "i like" in query_lower
+
+    ):
+
+        if user_query not in memory_data_dict[
+            "facts"
+        ]["preferences"]:
+
+            memory_data_dict[
+                "facts"
+            ]["preferences"].append(
+                user_query
+            )
+
+    if (
+
+        "my name is" in query_lower
+
+        or "i am" in query_lower
+
+    ):
+
+        if user_query not in memory_data_dict[
+            "facts"
+        ]["user_info"]:
+
+            memory_data_dict[
+                "facts"
+            ]["user_info"].append(
+                user_query
+            )
+
+    with open(
+        MEMORY_FILE,
+        "w"
+    ) as f:
+
+        json.dump(
+            memory_data_dict,
+            f,
+            indent=2
         )
-
-        with open(memory_file, 'w') as f:
-
-            json.dump(memory_data_dict, f, indent=2)
