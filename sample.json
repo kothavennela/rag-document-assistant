@@ -1,0 +1,8 @@
+ {
+    "chat_history": [],
+    "memory_summary": "",
+    "facts": {
+        "preferences": [],
+        "user_info": []
+    }
+}
