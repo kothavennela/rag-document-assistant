@@ -9,5 +9,6 @@ A Retrieval-Augmented Generation (RAG) assistant built using:
 - Hallucination Control
 - Long-Term Memory
 - Chat history
-Complete Architecture built using real RAG-pipeline:
+
+**Complete Architecture built using real RAG-pipeline:**
 PDF → Text Extraction → Sentence Chunking → Embedding Generation (Sentence Transformers) → Vector Similarity Search (Dot Product/Cosine Similarity) → Context Retrieval → Prompt Construction → LLM Generation → Memory Storage → Streamlit Interface
